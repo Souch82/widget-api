@@ -101,6 +101,8 @@ async function getMappingFromMonday(originalBoardId) {
     });
 }
 async function getEmployeeProgress(boardId, statusColumnId) {
+  if (!boardId) return { forme: 0, enCours: 0, nonCommence: 0, total: 0 };
+  
   const result = await callMondayAPI(`
     query {
       boards(ids: [${boardId}]) {
@@ -116,7 +118,12 @@ async function getEmployeeProgress(boardId, statusColumnId) {
     }
   `);
 
-  const items = result.data?.boards[0]?.items_page?.items || [];
+  // Board supprimé ou inaccessible → retourner 0
+  if (!result.data?.boards?.length || !result.data.boards[0]) {
+    return { forme: 0, enCours: 0, nonCommence: 0, total: 0 };
+  }
+
+  const items = result.data.boards[0]?.items_page?.items || [];
   let forme = 0, enCours = 0, nonCommence = 0;
 
   for (const item of items) {
@@ -132,7 +139,6 @@ async function getEmployeeProgress(boardId, statusColumnId) {
 
   return { forme, enCours, nonCommence, total: forme + enCours + nonCommence };
 }
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
