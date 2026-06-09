@@ -78,6 +78,7 @@ async function getMappingFromMonday(originalBoardId) {
       boards(ids: [${process.env.MAPPING_BOARD_ID}]) {
         items_page(limit: 500) {
           items {
+            name
             column_values {
               id
               text
@@ -89,18 +90,16 @@ async function getMappingFromMonday(originalBoardId) {
   `);
 
   const items = result.data?.boards[0]?.items_page?.items || [];
-  return items.filter(item => {
-    const col = item.column_values.find(c => c.id === 'text');
-    return col && String(col.text) === String(originalBoardId);
-  }).map(item => {
-    const cols = item.column_values;
-    return {
-      boardDupliqueId: cols.find(c => c.id === 'text1')?.text,
-      userId: cols.find(c => c.id === 'text3')?.text
-    };
-  });
+  return items
+    .filter(item => String(item.name) === String(originalBoardId))
+    .map(item => {
+      const cols = item.column_values;
+      return {
+        boardDupliqueId: cols.find(c => c.id === 'text_mm45h7m7')?.text,
+        userId:          cols.find(c => c.id === 'text_mm455dn5')?.text
+      };
+    });
 }
-
 async function getEmployeeProgress(boardId, statusColumnId) {
   const result = await callMondayAPI(`
     query {
