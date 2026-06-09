@@ -25,15 +25,15 @@ async function callMondayAPI(query) {
   return response.json();
 }
 
-async function getUserInfo(userId) {
+async function getUsersInfo(userIds) {
+  if (!userIds.length) return {};
   const result = await callMondayAPI(`
-    query { users(ids: [${userId}]) { name photo_thumb_small } }
+    query { users(ids: [${userIds.join(',')}]) { id name photo_thumb_small } }
   `);
-  if (!result.data?.users?.length) return { name: null, photo: null };
-  return {
-    name: result.data.users[0].name,
-    photo: result.data.users[0].photo_thumb_small
-  };
+  const users = result.data?.users || [];
+  const map = {};
+  for (const u of users) map[String(u.id)] = { name: u.name, photo: u.photo_thumb_small };
+  return map;
 }
 
 async function getEmployeesFromCentralBoard() {
@@ -56,8 +56,10 @@ async function getEmployeesFromCentralBoard() {
 
   const items = result.data?.boards[0]?.items_page?.items || [];
 
-  // Extraire les userIds
-  const rawEmployees = items.map(item => {
+  // Extraire et dédupliquer les userIds
+  const seen = new Set();
+  const unique = [];
+  for (const item of items) {
     let userId = null;
     for (const col of item.column_values) {
       if (col.persons_and_teams?.length > 0) {
@@ -65,26 +67,24 @@ async function getEmployeesFromCentralBoard() {
         if (person) { userId = person.id; break; }
       }
     }
-    return { id: userId, itemName: item.name };
-  });
+    const key = userId || item.name;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push({ id: userId, itemName: item.name });
+    }
+  }
 
-  // Dédupliquer par userId
-  const seen = new Set();
-  const unique = rawEmployees.filter(e => {
-    const key = e.id || e.itemName;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // Une seule requête pour tous les utilisateurs
+  const userIds = unique.filter(e => e.id).map(e => e.id);
+  const usersMap = await getUsersInfo(userIds);
 
-  // Récupérer les infos utilisateur en parallèle
-  const employees = await Promise.all(unique.map(async e => {
-    const userInfo = e.id ? await getUserInfo(e.id) : { name: e.itemName, photo: null };
-    return { id: e.id, name: userInfo.name || e.itemName, photo: userInfo.photo };
+  return unique.map(e => ({
+    id: e.id,
+    name: e.id ? (usersMap[String(e.id)]?.name || e.itemName) : e.itemName,
+    photo: e.id ? (usersMap[String(e.id)]?.photo || null) : null
   }));
-
-  return employees;
 }
+
 
 async function getMappingFromMonday(originalBoardId) {
   const result = await callMondayAPI(`
