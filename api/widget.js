@@ -55,9 +55,9 @@ async function getEmployeesFromCentralBoard() {
   `);
 
   const items = result.data?.boards[0]?.items_page?.items || [];
-  const employees = [];
 
-  for (const item of items) {
+  // Extraire les userIds
+  const rawEmployees = items.map(item => {
     let userId = null;
     for (const col of item.column_values) {
       if (col.persons_and_teams?.length > 0) {
@@ -65,9 +65,23 @@ async function getEmployeesFromCentralBoard() {
         if (person) { userId = person.id; break; }
       }
     }
-    const userInfo = userId ? await getUserInfo(userId) : { name: item.name, photo: null };
-    employees.push({ id: userId, name: userInfo.name || item.name, photo: userInfo.photo });
-  }
+    return { id: userId, itemName: item.name };
+  });
+
+  // Dédupliquer par userId
+  const seen = new Set();
+  const unique = rawEmployees.filter(e => {
+    const key = e.id || e.itemName;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Récupérer les infos utilisateur en parallèle
+  const employees = await Promise.all(unique.map(async e => {
+    const userInfo = e.id ? await getUserInfo(e.id) : { name: e.itemName, photo: null };
+    return { id: e.id, name: userInfo.name || e.itemName, photo: userInfo.photo };
+  }));
 
   return employees;
 }
@@ -149,19 +163,20 @@ module.exports = async (req, res) => {
     if (!originalBoardId) return res.json({ boardName, employees: [] });
 
     const statusColumnId = STATUS_COLUMN_IDS[originalBoardId];
-    const mappingRows = await getMappingFromMonday(originalBoardId);
-    const centralEmployees = await getEmployeesFromCentralBoard();
 
-    const employees = [];
-    for (const emp of centralEmployees) {
+    // Lancer mapping + employés en parallèle
+    const [mappingRows, centralEmployees] = await Promise.all([
+      getMappingFromMonday(originalBoardId),
+      getEmployeesFromCentralBoard()
+    ]);
+
+    // Lancer tous les getEmployeeProgress en parallèle
+    const employees = await Promise.all(centralEmployees.map(async emp => {
       const row = mappingRows.find(r => String(r.userId) === String(emp.id));
-      if (!row) {
-        employees.push({ name: emp.name, photo: emp.photo, forme: 0, enCours: 0, nonCommence: 0, total: 0 });
-        continue;
-      }
+      if (!row) return { name: emp.name, photo: emp.photo, forme: 0, enCours: 0, nonCommence: 0, total: 0 };
       const stats = await getEmployeeProgress(row.boardDupliqueId, statusColumnId);
-      employees.push({ name: emp.name, photo: emp.photo, ...stats });
-    }
+      return { name: emp.name, photo: emp.photo, ...stats };
+    }));
 
     return res.json({ boardName, employees });
 
