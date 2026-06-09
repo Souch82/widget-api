@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/widget.js": {
+      "maxDuration": 30
+    }
+  }
+}
