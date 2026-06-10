@@ -274,6 +274,10 @@ async function updateCentralBoardStatus(originalBoardId, duplicatedBoardId) {
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // ✅ GET → health check
+  if (req.method === 'GET') {
+    return res.json({ status: 'ok', message: 'Sync endpoint active' });
+  }
 
   try {
     const payload = req.body;
