@@ -18,7 +18,7 @@ async function callMondayAPI(query) {
     headers: {
       'Content-Type': 'application/json',
       'Authorization': process.env.MONDAY_API_TOKEN,
-      'API-Version': '2024-01'
+      'API-Version': '2026-04'
     },
     body: JSON.stringify({ query })
   });
