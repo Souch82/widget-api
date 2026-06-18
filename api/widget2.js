@@ -25,6 +25,48 @@ async function callMondayAPI(query) {
   return response.json();
 }
 
+// ─── PAGINATION GÉNÉRIQUE (cursor-based) ──────────────────────
+// items_page est plafonné à 500 items par requête. Pour les boards
+// susceptibles de dépasser cette limite (board central, mapping, ou
+// boards dupliqués qui grossissent avec le temps), on enchaîne sur
+// next_items_page jusqu'à épuisement du curseur.
+// Retourne `null` si le board est supprimé/inaccessible, un tableau sinon.
+async function fetchAllItems(boardId, itemFieldsFragment) {
+  const firstResult = await callMondayAPI(`
+    query {
+      boards(ids: [${boardId}]) {
+        items_page(limit: 500) {
+          cursor
+          items { ${itemFieldsFragment} }
+        }
+      }
+    }
+  `);
+
+  const board = firstResult.data?.boards?.[0];
+  if (!board) return null;
+
+  let items = board.items_page?.items || [];
+  let cursor = board.items_page?.cursor || null;
+
+  while (cursor) {
+    const nextResult = await callMondayAPI(`
+      query {
+        next_items_page(limit: 500, cursor: "${cursor}") {
+          cursor
+          items { ${itemFieldsFragment} }
+        }
+      }
+    `);
+    const nextPage = nextResult.data?.next_items_page;
+    if (!nextPage) break;
+    items = items.concat(nextPage.items || []);
+    cursor = nextPage.cursor || null;
+  }
+
+  return items;
+}
+
 async function getUsersInfo(userIds) {
   if (!userIds.length) return {};
   const result = await callMondayAPI(`
@@ -37,24 +79,14 @@ async function getUsersInfo(userIds) {
 }
 
 async function getEmployeesFromCentralBoard() {
-  const result = await callMondayAPI(`
-    query {
-      boards(ids: [${process.env.CENTRAL_BOARD_ID}]) {
-        items_page(limit: 500) {
-          items {
-            id name
-            column_values {
-              ... on PeopleValue {
-                persons_and_teams { id kind }
-              }
-            }
-          }
-        }
+  const items = await fetchAllItems(process.env.CENTRAL_BOARD_ID, `
+    id name
+    column_values {
+      ... on PeopleValue {
+        persons_and_teams { id kind }
       }
     }
-  `);
-
-  const items = result.data?.boards[0]?.items_page?.items || [];
+  `) || [];
 
   // Extraire et dédupliquer les userIds
   const seen = new Set();
@@ -86,23 +118,14 @@ async function getEmployeesFromCentralBoard() {
 }
 
 async function getMappingFromMonday(originalBoardId) {
-  const result = await callMondayAPI(`
-    query {
-      boards(ids: [${process.env.MAPPING_BOARD_ID}]) {
-        items_page(limit: 500) {
-          items {
-            name
-            column_values {
-              id
-              text
-            }
-          }
-        }
-      }
+  const items = await fetchAllItems(process.env.MAPPING_BOARD_ID, `
+    name
+    column_values {
+      id
+      text
     }
-  `);
+  `) || [];
 
-  const items = result.data?.boards[0]?.items_page?.items || [];
   return items
     .filter(item => String(item.name) === String(originalBoardId))
     .map(item => {
@@ -115,11 +138,27 @@ async function getMappingFromMonday(originalBoardId) {
 }
 
 // ─── STATUTS DYNAMIQUES ──────────────────────────────────────
-// Va chercher la config réelle de la colonne statut (settings_str) pour
-// récupérer labels + couleurs Monday, au lieu de les coder en dur.
-// Appelé une seule fois par board (sur le board "original", utilisé comme
-// référence puisque les boards dupliqués partagent le même statusColumnId).
-
+// On récupère la config réelle de la colonne statut pour les labels +
+// couleurs Monday, au lieu de les coder en dur. Appelé une seule fois
+// par board (sur le board "original", utilisé comme référence puisque
+// les boards dupliqués partagent le même statusColumnId).
+//
+// `settings_str` est déprécié depuis l'API 2025-10 au profit du champ
+// typé `settings` (labels[] avec id / index / label / color / is_deactivated).
+// On utilise donc `settings` comme source de vérité pour la liste des
+// labels actifs et leur ordre d'affichage (`index`).
+//
+// MAIS le `color` renvoyé par `settings` est un nombre (position dans la
+// palette Monday), pas un hex exploitable, et il n'existe pas de mapping
+// nombre → hex officiellement documenté et stable pour les 40+ couleurs.
+// On continue donc à interroger `settings_str` EN PARALLÈLE, uniquement
+// pour récupérer le hex réel via `labels_colors` — ce champ fonctionne
+// toujours (déprécié ≠ supprimé). Important : `labels_colors` est indexé
+// par la clé legacy, qui correspond au `id` du nouveau format (pas à son
+// `index`, qui lui représente la position d'affichage et peut différer
+// de l'id si les labels ont été réordonnés). Le jour où monday retire
+// settings_str pour de bon, il faudra constituer une palette statique de
+// secours (numéro de couleur → hex) à la place de ce fallback.
 function extractColor(colorEntry) {
   if (!colorEntry) return null;
   if (typeof colorEntry === 'string') return colorEntry;
@@ -131,28 +170,55 @@ async function getStatusDefs(boardId, statusColumnId) {
     query {
       boards(ids: [${boardId}]) {
         columns(ids: ["${statusColumnId}"]) {
+          settings
           settings_str
         }
       }
     }
   `);
 
-  const settingsStr = result.data?.boards?.[0]?.columns?.[0]?.settings_str;
-  if (!settingsStr) return [];
+  const column = result.data?.boards?.[0]?.columns?.[0];
+  if (!column) return [];
 
-  let settings;
+  const typedLabels = Array.isArray(column.settings?.labels) ? column.settings.labels : null;
+
+  // Couleurs hex récupérées via le format legacy (clé = id du label)
+  let legacyColors = {};
+  if (column.settings_str) {
+    try {
+      legacyColors = JSON.parse(column.settings_str).labels_colors || {};
+    } catch {
+      console.error('Impossible de parser settings_str:', column.settings_str);
+    }
+  }
+
+  if (typedLabels) {
+    return typedLabels
+      .filter(l => !l.is_deactivated && l.label) // on ignore les labels désactivés/vides
+      .sort((a, b) => a.index - b.index)         // ordre d'affichage Monday
+      .map(l => ({
+        key:   l.label, // le texte du label sert de clé (stable, unique dans la colonne)
+        label: l.label,
+        color: extractColor(legacyColors[l.id]) || '#c4c4c4'
+      }));
+  }
+
+  // Filet de secours si `settings` est vide pour cette colonne (rare) :
+  // on retombe sur l'ancien format intégral de settings_str.
+  if (!column.settings_str) return [];
+
+  let legacy;
   try {
-    settings = JSON.parse(settingsStr);
+    legacy = JSON.parse(column.settings_str);
   } catch {
-    console.error('Impossible de parser settings_str:', settingsStr);
+    console.error('Impossible de parser settings_str:', column.settings_str);
     return [];
   }
 
-  const labels    = settings.labels || {};
-  const colors    = settings.labels_colors || {};
-  const positions = settings.labels_positions_v2 || {};
+  const labels    = legacy.labels || {};
+  const colors    = legacy.labels_colors || {};
+  const positions = legacy.labels_positions_v2 || {};
 
-  // Ordre d'affichage Monday si dispo, sinon ordre des index
   const indices = Object.keys(labels).sort((a, b) => {
     const posA = positions[a] ?? Number(a);
     const posB = positions[b] ?? Number(b);
@@ -160,9 +226,9 @@ async function getStatusDefs(boardId, statusColumnId) {
   });
 
   return indices
-    .filter(idx => labels[idx]) // ignore les slots vides du settings
+    .filter(idx => labels[idx])
     .map(idx => ({
-      key:   labels[idx],   // le texte du label sert de clé (stable, unique dans la colonne)
+      key:   labels[idx],
       label: labels[idx],
       color: extractColor(colors[idx]) || '#c4c4c4'
     }));
@@ -174,31 +240,30 @@ async function getEmployeeProgress(boardId, statusColumnId, statusDefs) {
 
   if (!boardId) return { counts, total: 0 };
 
-  const result = await callMondayAPI(`
-    query {
-      boards(ids: [${boardId}]) {
-        items_page(limit: 500) {
-          items {
-            column_values(ids: ["${statusColumnId}"]) {
-              type
-              ... on StatusValue { label }
-            }
-          }
-        }
-      }
+  const items = await fetchAllItems(boardId, `
+    column_values(ids: ["${statusColumnId}"]) {
+      type
+      ... on StatusValue { label }
     }
   `);
 
   // Board supprimé ou inaccessible → tout à 0
-  if (!result.data?.boards?.length || !result.data.boards[0]) {
+  if (items === null) {
     return { counts, total: 0 };
   }
 
-  const items = result.data.boards[0]?.items_page?.items || [];
   let total = 0;
 
   for (const item of items) {
     for (const col of item.column_values) {
+      // NB : on garde le check 'color' en filet de sécurité. Sur certaines
+      // colonnes Status (notamment celles avec un id préfixé "color_",
+      // comme les tiennes), monday peut encore renvoyer "color" comme
+      // valeur de `type` selon le contexte — c'est documenté pour les
+      // erreurs ColumnValueException, mais pas garanti à 100% sur ce champ
+      // précis sans test direct sur tes boards. Tu peux retirer cette
+      // branche si tu vérifies que `type` renvoie bien toujours "status"
+      // sur tes colonnes réelles.
       if (col.type === 'status' || col.type === 'color') {
         const label = col.label || ''; // '' = item sans statut défini
         counts[label] = (counts[label] || 0) + 1;
@@ -240,7 +305,7 @@ module.exports = async (req, res) => {
       return { name: emp.name, photo: emp.photo, total, counts };
     }));
 
-    // Filet de sécurité : si un item a un statut absent de settings_str
+    // Filet de sécurité : si un item a un statut absent des statusDefs
     // (édition manuelle, colonne désynchronisée...), on l'ajoute quand même
     // pour ne perdre aucune donnée dans le widget.
     const allKeys = new Set(statusDefs.map(d => d.key));
